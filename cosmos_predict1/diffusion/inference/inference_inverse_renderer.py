@@ -17,6 +17,7 @@
 import argparse
 import os
 import torch
+import time
 
 from cosmos_predict1.diffusion.inference.inference_utils import add_common_arguments
 from cosmos_predict1.diffusion.inference.diffusion_renderer_pipeline import DiffusionRendererPipeline
@@ -155,7 +156,12 @@ def demo(args: argparse.Namespace):
         num_video_frames=args.num_video_frames,
         seed=args.seed,
     )
-
+    print(">>> Initializing torch.compile...")
+    pipeline.model = torch.compile(
+        pipeline.model, 
+        mode="default"
+    )
+    # pipeline.net = torch.compile(pipeline.net, mode="default")
     # Prepare input data
     dataset = VideoFramesDataset(
         root_dir=args.dataset_path,
@@ -183,10 +189,43 @@ def demo(args: argparse.Namespace):
             context_index = GBUFFER_INDEX_MAPPING[gbuffer_pass]
             data_batch["context_index"].fill_(context_index)
 
-            output = pipeline.generate_video(
-                data_batch=data_batch,
-                normalize_normal=(gbuffer_pass == 'normal' and args.normalize_normal),
-            )
+            is_first_run = (i == 0 and gbuffer_pass == args.inference_passes[0])
+            
+            if is_first_run:
+                print(">>> 启动 PyTorch Profiler (Cosmos 7B)...")
+                with torch.profiler.profile(
+                    activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                    on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/cosmos_perf'),
+                    record_shapes=True,
+                    with_stack=True
+                ) as prof:
+                    torch.cuda.synchronize()
+                    start_t = time.perf_counter()
+                    
+                    output = pipeline.generate_video(
+                        data_batch=data_batch,
+                        normalize_normal=(gbuffer_pass == 'normal' and args.normalize_normal),
+                    )
+                    
+                    torch.cuda.synchronize()
+                    prof.step()
+                
+                # 打印出最耗时的前 15 个算子
+                print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=15))
+            else:
+                # 正常推理并手动计时
+                torch.cuda.synchronize()
+                start_t = time.perf_counter()
+                
+                output = pipeline.generate_video(
+                    data_batch=data_batch,
+                    normalize_normal=(gbuffer_pass == 'normal' and args.normalize_normal),
+                )
+                
+                torch.cuda.synchronize()
+            
+            duration = time.perf_counter() - start_t
+            print(f">>> {gbuffer_pass} 处理完成，精确耗时: {duration:.4f} 秒")
             
             # Save output as individual frames
             if args.save_image:
